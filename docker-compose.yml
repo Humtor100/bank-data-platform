@@ -1,0 +1,347 @@
+services:
+
+  # ============================================================
+  # 1. ОСНОВНАЯ БАЗА НАШЕГО БАНКОВСКОГО ПРОЕКТА
+  # ============================================================
+
+  bank-db:
+    image: postgres:17
+
+    container_name: bank-db
+
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_DB: bank_db
+      POSTGRES_USER: bank_user
+      POSTGRES_PASSWORD: bank_password
+
+    ports:
+      - "5433:5432"
+
+    volumes:
+      - bank_data:/var/lib/postgresql/data
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U bank_user -d bank_db"
+        ]
+
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+
+
+  # ============================================================
+  # 2. POSTGRESQL ДЛЯ СЛУЖЕБНЫХ ДАННЫХ AIRFLOW
+  #
+  # Это НЕ наша банковская БД.
+  #
+  # Здесь Airflow хранит:
+  # - DAG runs
+  # - task instances
+  # - connections
+  # - metadata
+  # - историю запусков
+  # ============================================================
+
+  airflow-meta:
+
+    image: postgres:17
+
+    container_name: airflow-meta
+
+    restart: unless-stopped
+
+    environment:
+
+      POSTGRES_DB: airflow
+
+      POSTGRES_USER: airflow
+
+      POSTGRES_PASSWORD: airflow
+
+    volumes:
+
+      - airflow_metadata:/var/lib/postgresql/data
+
+    healthcheck:
+
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U airflow -d airflow"
+        ]
+
+      interval: 5s
+
+      timeout: 5s
+
+      retries: 20
+
+
+
+  # ============================================================
+  # 3. INITIALIZATION НАШЕЙ BANK_DB
+  #
+  # Это одноразовый контейнер.
+  #
+  # Его задача:
+  #
+  # 1. дождаться PostgreSQL;
+  # 2. создать OLTP;
+  # 3. добавить тестовые данные;
+  # 4. создать staging;
+  # 5. создать DWH;
+  # 6. создать dimensions;
+  # 7. создать fact;
+  # 8. создать mart.
+  #
+  # После выполнения контейнер должен завершиться:
+  #
+  # Exited (0)
+  #
+  # Это НОРМАЛЬНО.
+  # ============================================================
+
+  bank-init:
+    image: postgres:17
+
+    container_name: bank-init
+
+    depends_on:
+      bank-db:
+        condition: service_healthy
+
+    environment:
+      PGPASSWORD: bank_password
+
+    volumes:
+      - ./sql:/sql:ro
+
+    command:
+      - bash
+      - -c
+      - |
+        set -e
+
+        echo "============================================"
+        echo "Starting bank database initialization"
+        echo "============================================"
+
+        echo "Waiting for PostgreSQL..."
+
+        until pg_isready \
+          -h bank-db \
+          -p 5432 \
+          -U bank_user \
+          -d bank_db
+        do
+          sleep 2
+        done
+
+        echo ""
+        echo "PostgreSQL is ready."
+        echo ""
+
+        echo "1. Creating OLTP tables..."
+
+        psql \
+          -h bank-db \
+          -p 5432 \
+          -U bank_user \
+          -d bank_db \
+          -v ON_ERROR_STOP=1 \
+          -f /sql/01_oltp/001_create_tables.sql
+
+        echo "OLTP tables created."
+
+
+        echo ""
+        echo "2. Loading seed data..."
+
+        psql \
+          -h bank-db \
+          -p 5432 \
+          -U bank_user \
+          -d bank_db \
+          -v ON_ERROR_STOP=1 \
+          -f /sql/01_oltp/002_seed_data.sql
+
+        echo "Seed data loaded."
+
+
+        echo ""
+        echo "3. Creating staging layer..."
+
+        psql \
+          -h bank-db \
+          -p 5432 \
+          -U bank_user \
+          -d bank_db \
+          -v ON_ERROR_STOP=1 \
+          -f /sql/02_staging/001_create_staging.sql
+
+        echo "Staging created."
+
+
+        echo ""
+        echo "4. Creating DWH dimensions..."
+
+        psql \
+          -h bank-db \
+          -p 5432 \
+          -U bank_user \
+          -d bank_db \
+          -v ON_ERROR_STOP=1 \
+          -f /sql/03_dwh/001_create_dimensions.sql
+
+        echo "Dimensions created."
+
+
+        echo ""
+        echo "5. Creating fact table..."
+
+        psql \
+          -h bank-db \
+          -p 5432 \
+          -U bank_user \
+          -d bank_db \
+          -v ON_ERROR_STOP=1 \
+          -f /sql/03_dwh/005_create_fact.sql
+
+        echo "Fact table created."
+
+
+        echo ""
+        echo "6. Creating mart..."
+
+        psql \
+          -h bank-db \
+          -p 5432 \
+          -U bank_user \
+          -d bank_db \
+          -v ON_ERROR_STOP=1 \
+          -f /sql/04_mart/001_create_daily_mart.sql
+
+        echo "Mart created."
+
+
+        echo ""
+        echo "============================================"
+        echo "Bank database initialization completed"
+        echo "============================================"
+
+    restart: "no"
+
+
+  # ============================================================
+  # 4. AIRFLOW
+  # ============================================================
+
+  airflow:
+
+    build:
+
+      context: .
+
+      dockerfile: Dockerfile.airflow
+
+    container_name: bank-airflow
+
+    restart: unless-stopped
+
+
+    depends_on:
+
+      airflow-meta:
+        condition: service_healthy
+
+      bank-db:
+        condition: service_healthy
+
+      bank-init:
+        condition: service_completed_successfully
+
+
+    command: standalone
+
+
+    ports:
+
+      - "8080:8080"
+
+
+    environment:
+
+      # ========================================================
+      # AIRFLOW HOME
+      # ========================================================
+
+      AIRFLOW_HOME: /opt/airflow
+
+
+      # ========================================================
+      # НЕ ЗАГРУЖАТЬ ДЕМО DAG-и
+      # ========================================================
+
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+
+
+      # ========================================================
+      # METADATA DATABASE AIRFLOW
+      # ========================================================
+
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: >-
+        postgresql+psycopg2://airflow:airflow@airflow-meta:5432/airflow
+
+
+      # ========================================================
+      # CONNECTION К НАШЕМУ bank_db
+      #
+      # ВАЖНО:
+      #
+      # Airflow и bank-db находятся
+      # в одной docker network.
+      #
+      # Поэтому используем:
+      #
+      # bank-db:5432
+      #
+      # А НЕ:
+      #
+      # localhost:5433
+      # ========================================================
+
+      AIRFLOW_CONN_BANK_POSTGRES: >-
+        postgresql://bank_user:bank_password@bank-db:5432/bank_db
+
+
+    volumes:
+
+      # DAG-и
+      - ./airflow/dags:/opt/airflow/dags
+
+      # Логи
+      - ./airflow/logs:/opt/airflow/logs
+
+      # Plugins
+      - ./airflow/plugins:/opt/airflow/plugins
+
+      # SQL нашего проекта
+      - ./sql:/opt/airflow/sql:ro
+
+
+
+# ==============================================================
+# DOCKER VOLUMES
+# ==============================================================
+
+volumes:
+
+  bank_data:
+
+  airflow_metadata:
