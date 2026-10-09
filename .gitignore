@@ -4,3 +4,4 @@ __pycache__/
 airflow/logs/*
 !airflow/logs/.gitkeep
 .env.local
+.latex

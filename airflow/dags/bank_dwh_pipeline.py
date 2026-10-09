@@ -143,7 +143,13 @@ with DAG(
 
         sql="03_dwh/006_load_fact.sql",
 
-        autocommit=True,
+        autocommit=False,
+
+        split_statements=False,
+
+        retries=2,
+
+        retry_delay=timedelta(minutes=1),
     )
 
 
